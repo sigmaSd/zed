@@ -73,15 +73,18 @@ use postage::watch;
 use prettier_support::{DefaultPrettier, PrettierInstance};
 use project_settings::{DirenvSettings, LspSettings, ProjectSettings};
 use rand::prelude::*;
-use rpc::ErrorCode;
+use remote::SshSession;
+use rpc::{proto::AddWorktree, ErrorCode};
 use search::SearchQuery;
 use search_history::SearchHistory;
 use serde::Serialize;
 use settings::{watch_config_file, Settings, SettingsLocation, SettingsStore};
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
-use smol::channel::{Receiver, Sender};
-use smol::lock::Semaphore;
+use smol::{
+    channel::{Receiver, Sender},
+    lock::Semaphore,
+};
 use snippet::Snippet;
 use snippet_provider::SnippetProvider;
 use std::{
@@ -195,6 +198,7 @@ pub struct Project {
     >,
     user_store: Model<UserStore>,
     fs: Arc<dyn Fs>,
+    ssh_session: Option<Arc<SshSession>>,
     client_state: ProjectClientState,
     collaborators: HashMap<proto::PeerId, Collaborator>,
     client_subscriptions: Vec<client::Subscription>,
@@ -747,6 +751,7 @@ impl Project {
                 client,
                 user_store,
                 fs,
+                ssh_session: None,
                 next_entry_id: Default::default(),
                 next_diagnostic_group_id: Default::default(),
                 diagnostics: Default::default(),
@@ -777,6 +782,24 @@ impl Project {
                 search_history: Self::new_search_history(),
             }
         })
+    }
+
+    pub fn ssh(
+        client: Arc<Client>,
+        ssh_session: Arc<SshSession>,
+        node: Arc<dyn NodeRuntime>,
+        user_store: Model<UserStore>,
+        languages: Arc<LanguageRegistry>,
+        fs: Arc<dyn Fs>,
+        cx: &mut AppContext,
+    ) -> Model<Self> {
+        let this = Self::local(client, node, user_store, languages, fs, cx);
+        this.update(cx, |this, cx| {
+            ssh_session.add_message_handler(cx.weak_model(), Self::handle_update_worktree);
+            ssh_session.add_message_handler(cx.weak_model(), Self::handle_create_buffer_for_peer);
+            this.ssh_session = Some(ssh_session);
+        });
+        this
     }
 
     pub async fn remote(
@@ -878,6 +901,7 @@ impl Project {
                 snippets,
                 yarn,
                 fs,
+                ssh_session: None,
                 next_entry_id: Default::default(),
                 next_diagnostic_group_id: Default::default(),
                 diagnostic_summaries: Default::default(),
@@ -7419,19 +7443,40 @@ impl Project {
         abs_path: impl AsRef<Path>,
         visible: bool,
         cx: &mut ModelContext<Self>,
-    ) -> Task<Result<Model<Worktree>>> {
+    ) -> impl 'static + Future<Output = Result<Model<Worktree>>> {
+        let ssh_session = self.ssh_session.clone();
         let fs = self.fs.clone();
         let next_entry_id = self.next_entry_id.clone();
         let path: Arc<Path> = abs_path.as_ref().into();
-        let task = self
-            .loading_local_worktrees
+        self.loading_local_worktrees
             .entry(path.clone())
             .or_insert_with(|| {
                 cx.spawn(move |project, mut cx| {
                     async move {
-                        let worktree =
-                            Worktree::local(path.clone(), visible, fs, next_entry_id, &mut cx)
-                                .await;
+                        let worktree = if let Some(ssh) = ssh_session {
+                            let root_name = path.file_name().unwrap().to_string_lossy().to_string();
+                            let path = path.to_string_lossy().to_string();
+                            ssh.request(AddWorktree { path: path.clone() })
+                                .await
+                                .and_then(|response| {
+                                    cx.update(|cx| {
+                                        Worktree::remote(
+                                            0,
+                                            0,
+                                            proto::WorktreeMetadata {
+                                                id: response.worktree_id,
+                                                root_name,
+                                                visible,
+                                                abs_path: path,
+                                            },
+                                            ssh.clone().into(),
+                                            cx,
+                                        )
+                                    })
+                                })
+                        } else {
+                            Worktree::local(path.clone(), visible, fs, next_entry_id, &mut cx).await
+                        };
 
                         project.update(&mut cx, |project, _| {
                             project.loading_local_worktrees.remove(&path);
@@ -7454,13 +7499,8 @@ impl Project {
                 })
                 .shared()
             })
-            .clone();
-        cx.background_executor().spawn(async move {
-            match task.await {
-                Ok(worktree) => Ok(worktree),
-                Err(err) => Err(anyhow!("{}", err)),
-            }
-        })
+            .clone()
+            .map_err(|error| anyhow!("{error}"))
     }
 
     pub fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut ModelContext<Self>) {

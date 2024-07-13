@@ -266,6 +266,10 @@ message Envelope {
 
         GetSignatureHelp get_signature_help = 217;
         GetSignatureHelpResponse get_signature_help_response = 218; // current max
+
+        // Remote
+        AddWorktree add_worktree = 500;
+        AddWorktreeResponse add_worktree_response = 501;
     }
 
     reserved 158 to 161;
@@ -2373,4 +2377,14 @@ message SynchronizeContexts {
 
 message SynchronizeContextsResponse {
     repeated ContextVersion contexts = 1;
+}
+
+// Remote FS
+
+message AddWorktree {
+    string path = 1;
+}
+
+message AddWorktreeResponse {
+    uint64 worktree_id = 1;
 }
